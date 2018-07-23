@@ -4,6 +4,7 @@ import bitstring
 
 from .vex_helper import *
 from ..lifter import Lifter
+from ...block import IRSB
 
 l = logging.getLogger(__name__)
 
@@ -16,8 +17,25 @@ def is_empty(bitstrm):
 
 
 class ParseError(Exception):
+    """This exception is used by the instruction's parse method to signal that the tried instruction does not
+    match at the current position.
+    """
     pass
 
+
+class RequireContextError(Exception):
+    """This exception indicates the the instruction requires a larger number of surrounding instruction context
+    than provided to compute its sematics. For example, some architectures have instructions to "skip the next"
+    instruction. If you such an instruction appears at the end of a block to lift, this exception can be raised.
+
+    It is important that no modifications have been applied to the IRSB before this exception is raised, as
+    these cannot be rolled back.
+
+    :ivar int amount: At least this many future (if positive) or past (if negative) are requied to interpret the instruction. This is a lower bound, the actual number may be higher.
+    """
+
+    def __init__(self, amount=0):
+        self.amount = amount
 
 class GymratLifter(Lifter):
     """
@@ -38,7 +56,7 @@ class GymratLifter(Lifter):
         # Try every instruction until one works
         for possible_instr in self.instrs:
             try:
-                l.info("Trying " + possible_instr.name)
+                l.info("Trying %s", possible_instr.name)
                 return possible_instr(self.bitstrm, self.irsb.arch, addr)
             # a ParserError signals that this instruction did not match
             # we need to try other instructions, so we ignore this error
@@ -53,7 +71,7 @@ class GymratLifter(Lifter):
         # If no instruction matches, log an error
         errorstr = 'Unknown instruction at bit position %d' % self.bitstrm.bitpos
         l.debug(errorstr)
-        l.debug("Address: %#08x" % addr)
+        l.debug("Address: %#08x", addr)
 
     def decode(self):
         try:
@@ -61,7 +79,7 @@ class GymratLifter(Lifter):
             count = 0
             disas = []
             addr = self.irsb._addr
-            l.debug("Starting block at address: " + hex(addr))
+            l.debug("Starting block at address: %#08x", addr)
             bytepos = self.bitstrm.bytepos
 
 
@@ -69,7 +87,7 @@ class GymratLifter(Lifter):
                 instr = self._decode_next_instruction(addr)
                 if not instr: break
                 disas.append(instr)
-                l.debug("Matched " + instr.name)
+                l.debug("Matched %s", instr.name)
                 addr += self.bitstrm.bytepos - bytepos
                 bytepos = self.bitstrm.bytepos
                 count += 1
@@ -86,21 +104,47 @@ class GymratLifter(Lifter):
 
         if disassemble:
             return [instr.disassemble() for instr in instructions]
-        self.irsb.jumpkind = JumpKind.Invalid
-        irsb_c = IRSBCustomizer(self.irsb)
+
         l.debug("Decoding complete.")
+        self.irsb.jumpkind = None
         for i, instr in enumerate(instructions[:self.max_inst]):
-            l.debug("Lifting instruction " + instr.name)
-            instr(irsb_c, instructions[:i], instructions[i+1:])
-            if irsb_c.irsb.jumpkind != JumpKind.Invalid:
+            # first, create a scratch IRSB so we can throw the changes away if lifting fails
+            next_irsb_part = IRSB.empty_block(self.irsb.arch, self.irsb.addr)
+            irsb_c = IRSBCustomizer(next_irsb_part)
+
+            # try to do the lifting
+            # if the instruction requires more context, we stop
+            # decoding here and just return the block we have so far
+            l.debug("Lifting instruction %s", instr.name)
+            try:
+                instr(irsb_c, instructions[:i], instructions[i+1:])
+            except RequireContextError:
                 break
-            elif (i+1) == self.max_inst: # if we are on our last iteration
-                instr.jump(None, irsb_c.irsb.addr + irsb_c.irsb.size)
+
+            # lifting was successful so add the part to the full IRSB
+            self.irsb.extend(next_irsb_part)
+
+            # if the irsb has a conditional exit, end the block here
+            # angr doesn't like blocks that have conditional jumps in the middle (not at the end)
+            if irsb_c.has_conditional_exit:
+                self.irsb.next = Const(vex_int_class(self.irsb.arch.bits)(self.irsb.addr + self.irsb.size))
+                self.irsb.jumpkind = JumpKind.Boring
                 break
-        else:
-            if len(irsb_c.irsb.statements) == 0:
-                raise LiftingException('Could not decode any instructions')
-            irsb_c.irsb.jumpkind = JumpKind.NoDecode
+
+            # if the block has a jumpkind, this is a full block so we can exit
+            if self.irsb.jumpkind is not None:
+                break
+
+        if not self.irsb.statements:
+            raise LiftingException('Could not lift any instructions')
+
+        if self.irsb.jumpkind is None:
+            if self.max_inst is not None and len(instructions) >= self.max_inst:
+                self.irsb.next = Const(vex_int_class(self.irsb.arch.bits)(self.irsb.addr + self.irsb.size))
+                self.irsb.jumpkind = JumpKind.Boring
+            else:
+                self.irsb.jumpkind = JumpKind.NoDecode
+
         l.debug(self.irsb._pp_str())
         if dump_irsb:
             self.irsb.pp()
